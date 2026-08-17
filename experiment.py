@@ -26,14 +26,13 @@ import torch
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 SMALL_MODEL = "Qwen/Qwen3.5-2B"
-# LARGE_MODEL = "Qwen/Qwen3.5-9B"
-LARGE_MODEL = "Qwen/Qwen3.5-4B"
+LARGE_MODEL = "Qwen/Qwen3.5-9B"
 EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_MAX_TOKENS = 512
 DEFAULT_TOP_K = 3
-DEFAULT_ROLES = ["analyst", "researcher", "formatter"]
+DEFAULT_ROLES = ["analyst", "researcher", "reviewer"]
 
 STOPWORDS = {
     "the", "a", "an", "and", "or", "but", "of", "in", "on", "for", "to",
@@ -76,10 +75,17 @@ class HFModel(BaseModel):
         self.model.eval()
 
     def generate(self, prompt: str, temperature: float = DEFAULT_TEMPERATURE,
-                 max_tokens: int = DEFAULT_MAX_TOKENS) -> Generation:
+                 max_tokens: int = DEFAULT_MAX_TOKENS, think: bool = False) -> Generation:
         try:
             started = time.perf_counter()
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+            
+            # System prompt to control thinking mode
+            if think:
+                full_prompt = f"<system>You are a reasoning model. Please think step-by-step inside <think> tags before providing your final answer.</system>\\n{prompt}"
+            else:
+                full_prompt = f"<system>You are a helpful assistant. Provide a direct answer without using <think> tags or internal reasoning blocks.</system>\\n{prompt}"
+            
+            inputs = self.tokenizer(full_prompt, return_tensors="pt").to(self.model.device)
             input_len = inputs["input_ids"].shape[1]
 
             with torch.no_grad():
@@ -307,8 +313,9 @@ def run_experiment(experiment_id: str, tasks: Sequence[str],
                    runs: int = 1,
                    embedder: Optional[Callable[[str], List[float]]] = None,
                    small_model_name: str = SMALL_MODEL,
-                   large_model_name: str = LARGE_MODEL) -> Dict[str, Any]:
-    print(f"\n>>> Starting Experiment {experiment_id}")
+                   large_model_name: str = LARGE_MODEL,
+                   think: bool = False) -> Dict[str, Any]:
+    print(f"\n>>> Starting Experiment {experiment_id} (Thinking: {'ON' if think else 'OFF'})")
     if experiment_id in ("2", "3"):
         if not knowledge_base:
             raise ValueError(f"knowledge_base required for experiment {experiment_id}")
@@ -317,7 +324,7 @@ def run_experiment(experiment_id: str, tasks: Sequence[str],
 
     print(f"Loading models: {small_model_name}, {large_model_name}...")
     small = HFModel(small_model_name)
-    large = HFModel(large_model_name)
+    large = HFModel(large_//model_name)
 
     rag = RagModule(knowledge_base, embedder, top_k=top_k) if knowledge_base else None
     small_rag = ModelWithRag(small, rag) if rag else None
@@ -332,17 +339,17 @@ def run_experiment(experiment_id: str, tasks: Sequence[str],
 
         if experiment_id == "1":
             print("  Running 2B model...")
-            configs["2b"] = pack_run([small.generate(task) for _ in range(runs)], task)
+            configs["2b"] = pack_run([small.generate(task, think=think) for _ in range(runs)], task)
             print("  Running 9B model...")
-            configs["9b"] = pack_run([large.generate(task) for _ in range(runs)], task)
+            configs["9b"] = pack_run([large.generate(task, think=think) for _ in range(runs)], task)
 
         elif experiment_id == "2":
             print("  Running 2B+RAG...")
             configs["2b+RAG"] = pack_run(
-                [small_rag.generate(task) for _ in range(runs)], task)
+                [small_rag.generate(task, think=think) for _ in range(runs)], task)
             print("  Running 9B+RAG...")
             configs["9b+RAG"] = pack_run(
-                [large_rag.generate(task) for _ in range(runs)], task)
+                [large_rag.generate(task, think=think) for _ in range(runs)], task)
 
         elif experiment_id == "3":
             print("  Running MAS(2B+RAG)...")
@@ -434,6 +441,8 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--runs", type=int, default=1,
                         help="repetitions per configuration (for consistency)")
+    parser.add_argument("--think", choices=["on", "off"], default="off",
+                        help="enable or disable thinking mode")
     parser.add_argument("--small-model", default=SMALL_MODEL)
     parser.add_argument("--large-model", default=LARGE_MODEL)
     parser.add_argument("--embed-model", default=EMBED_MODEL,
