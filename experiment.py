@@ -26,7 +26,8 @@ import torch
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 SMALL_MODEL = "Qwen/Qwen3.5-2B"
-LARGE_MODEL = "Qwen/Qwen3.5-9B"
+# LARGE_MODEL = "Qwen/Qwen3.5-9B"
+LARGE_MODEL = "Qwen/Qwen3.5-4B"
 EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
 DEFAULT_TEMPERATURE = 0.7
@@ -70,8 +71,8 @@ class HFModel(BaseModel):
         self.name = name
         self.tokenizer = AutoTokenizer.from_pretrained(name)
         self.model = AutoModelForCausalLM.from_pretrained(
-            name, torch_dtype=torch.float16, device_map="auto"
-        )
+            name, dtype=torch.float16 # , device_map="auto"
+        ).to("cuda")
         self.model.eval()
 
     def generate(self, prompt: str, temperature: float = DEFAULT_TEMPERATURE,
@@ -307,12 +308,14 @@ def run_experiment(experiment_id: str, tasks: Sequence[str],
                    embedder: Optional[Callable[[str], List[float]]] = None,
                    small_model_name: str = SMALL_MODEL,
                    large_model_name: str = LARGE_MODEL) -> Dict[str, Any]:
+    print(f"\n>>> Starting Experiment {experiment_id}")
     if experiment_id in ("2", "3"):
         if not knowledge_base:
             raise ValueError(f"knowledge_base required for experiment {experiment_id}")
         if embedder is None:
             raise ValueError("embedder required when knowledge_base provided")
 
+    print(f"Loading models: {small_model_name}, {large_model_name}...")
     small = HFModel(small_model_name)
     large = HFModel(large_model_name)
 
@@ -323,20 +326,26 @@ def run_experiment(experiment_id: str, tasks: Sequence[str],
 
     results: Dict[str, Any] = {"experiment": experiment_id, "tasks": {}}
 
-    for task in tasks:
+    for i, task in enumerate(tasks, 1):
+        print(f"\nTask {i}/{len(tasks)}: {task[:60]}...")
         configs: Dict[str, Dict[str, Any]] = {}
 
         if experiment_id == "1":
+            print("  Running 2B model...")
             configs["2b"] = pack_run([small.generate(task) for _ in range(runs)], task)
+            print("  Running 9B model...")
             configs["9b"] = pack_run([large.generate(task) for _ in range(runs)], task)
 
         elif experiment_id == "2":
+            print("  Running 2B+RAG...")
             configs["2b+RAG"] = pack_run(
                 [small_rag.generate(task) for _ in range(runs)], task)
+            print("  Running 9B+RAG...")
             configs["9b+RAG"] = pack_run(
                 [large_rag.generate(task) for _ in range(runs)], task)
 
         elif experiment_id == "3":
+            print("  Running MAS(2B+RAG)...")
             mas_runs = []
             for _ in range(runs):
                 mas_result = mas.run(task)
@@ -363,11 +372,14 @@ def run_experiment(experiment_id: str, tasks: Sequence[str],
                     "keyword_coverage": keyword_coverage(task, final_texts[-1]) if final_texts else 0.0,
                 },
             }
+            print("  Running 9B+RAG...")
             configs["9b+RAG"] = pack_run(
                 [large_rag.generate(task) for _ in range(runs)], task)
 
         results["tasks"][task] = configs
+        print(f"  ✓ Task {i} completed.")
 
+    print(f"\n>>> Experiment {experiment_id} finished successfully.")
     return results
 
 

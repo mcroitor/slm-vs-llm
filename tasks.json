@@ -1,0 +1,7 @@
+[
+  "Explain the core difference between standard Large Language Models and Multi-Agent Systems based on Small Language Models, specifically regarding their knowledge capacity.",
+  "How does Retrieval-Augmented Generation (RAG) help smaller language models overcome their inherent parameter limitations when dealing with specialized domain knowledge?",
+  "Analyze the potential advantages of using a multi-agent architecture (controller, experts, and synthesizer) for generating structured academic responses compared to a single-model approach.",
+  "What are the primary computational trade-offs between deploying one medium-sized model (e.g., 9B parameters) versus an ensemble of smaller models (e.g., 2B parameters) in a local environment?",
+  "Evaluate the role of 'role specialization' in multi-agent systems: how does assigning specific roles (like analyst or researcher) to SLMs improve the final synthesized answer?"
+]

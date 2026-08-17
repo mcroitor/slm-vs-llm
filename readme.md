@@ -40,6 +40,19 @@ The project uses models from the Qwen family. The script will automatically down
 
 *Note: Ensure you have enough GPU memory (VRAM) to load the 9B model, or consider using a machine with at least 24GB VRAM for smooth execution.*
 
+### 3. Knowledge Base Preparation
+
+The RAG system requires a knowledge base in JSON format. You can easily create it from a collection of Markdown files:
+
+1. Create a `data/` folder and place your `.md` documents there.
+2. Run the preparation script:
+
+```bash
+python prepare_kb.py --data data --out kb.json
+```
+
+This will scan the folder and generate a `kb.json` file containing all the text from your documents.
+
 ## Running Experiments
 
 The `experiment.py` script allows you to run one of the three experimental scenarios described in the methodology.
