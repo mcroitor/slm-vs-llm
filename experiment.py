@@ -22,12 +22,14 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-import requests
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from sentence_transformers import SentenceTransformer
+import torch
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-SMALL_MODEL = "qwen3.5:2b"
-LARGE_MODEL = "qwen3.5:9b"
-EMBED_MODEL = "nomic-embed-text"
+SMALL_MODEL = "Qwen/Qwen3.5-2B"
+LARGE_MODEL = "Qwen/Qwen3.5-9B"
+EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_MAX_TOKENS = 512
@@ -44,49 +46,9 @@ STOPWORDS = {
 
 
 class OllamaClient:
-    def __init__(self, host: str = OLLAMA_HOST, timeout: int = 600):
-        self.host = host
-        self.timeout = timeout
-
-    def generate(self, model: str, prompt: str, temperature: float,
-                 max_tokens: int, think: bool) -> Dict[str, Any]:
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "stream": False,
-            "think": think,
-            "options": {
-                "temperature": temperature,
-                "num_predict": max_tokens,
-            },
-        }
-        started = time.perf_counter()
-        response = requests.post(
-            f"{self.host}/api/generate", json=payload, timeout=self.timeout
-        )
-        response.raise_for_status()
-        latency = time.perf_counter() - started
-        data = response.json()
-        data["_latency_s"] = latency
-        return data
-
-    def embed(self, model: str, text: str) -> List[float]:
-        response = requests.post(
-            f"{self.host}/api/embed",
-            json={"model": model, "input": text},
-            timeout=self.timeout,
-        )
-        if response.status_code == 404:
-            response = requests.post(
-                f"{self.host}/api/embeddings",
-                json={"model": model, "prompt": text},
-                timeout=self.timeout,
-            )
-        response.raise_for_status()
-        data = response.json()
-        if "embeddings" in data:
-            return data["embeddings"][0]
-        return data["embedding"]
+    """Legacy client kept for compatibility or removed if unused.
+    Direct HF models are now used in OllamaModel class."""
+    pass
 
 
 @dataclass
@@ -118,25 +80,42 @@ class OllamaModel(BaseModel):
         super().__init__(client)
         self.name = name
         self.think = think
+        self.tokenizer = AutoTokenizer.from_pretrained(name)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            name, torch_dtype=torch.float16, device_map="auto"
+        )
 
     def generate(self, prompt: str, temperature: float = DEFAULT_TEMPERATURE,
                  max_tokens: int = DEFAULT_MAX_TOKENS) -> Generation:
         try:
-            data = self.client.generate(
-                self.name, prompt, temperature, max_tokens, self.think
+            started = time.perf_counter()
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+            
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                do_sample=True if temperature > 0 else False,
+                pad_token_id=self.tokenizer.eos_token_id
             )
-        except requests.RequestException as exc:
+            
+            latency = time.perf_counter() - started
+            full_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Remove the original prompt from the response
+            response_text = full_text[len(prompt):].strip()
+            
+            prompt_tokens = inputs["input_ids"].shape[1]
+            completion_tokens = len(outputs[0]) - prompt_tokens
+            
+            return Generation(
+                text=response_text,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_s=latency,
+                tokens_per_s=completion_tokens / latency if latency else 0.0,
+            )
+        except Exception as exc:
             return Generation(error=f"{type(exc).__name__}: {exc}")
-        completion = int(data.get("eval_count", 0))
-        eval_ns = int(data.get("eval_duration", 0))
-        tps = completion / (eval_ns / 1e9) if eval_ns else 0.0
-        return Generation(
-            text=data.get("response", "").strip(),
-            prompt_tokens=int(data.get("prompt_eval_count", 0)),
-            completion_tokens=completion,
-            latency_s=float(data["_latency_s"]),
-            tokens_per_s=round(tps, 2),
-        )
 
 
 class ModelWithRag:
@@ -429,9 +408,6 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--runs", type=int, default=1,
                         help="repetitions per configuration (for consistency)")
-    parser.add_argument("--embedder", choices=["ollama", "sentence_transformers"],
-                        default="ollama",
-                        help="embedding backend for RAG")
     parser.add_argument("--small-model", default=SMALL_MODEL)
     parser.add_argument("--large-model", default=LARGE_MODEL)
     parser.add_argument("--think", action="store_true",
@@ -443,18 +419,12 @@ def main() -> None:
     tasks = json.load(open(args.tasks, encoding="utf-8")) if args.tasks else DEFAULT_TASKS
     kb = json.load(open(args.kb, encoding="utf-8")) if args.kb else DEFAULT_KB
 
-    if args.embedder == "sentence_transformers":
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as exc:
-            raise SystemExit(
-                "sentence-transformers is not installed; "
-                "run `pip install sentence-transformers` or use --embedder ollama"
-            ) from exc
-        encoder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    # Use SentenceTransformer for embedding
+    try:
+        encoder = SentenceTransformer(EMBED_MODEL)
         embedder = lambda text: encoder.encode(text).tolist()
-    else:
-        embedder = lambda text: OllamaClient().embed(EMBED_MODEL, text)
+    except Exception as exc:
+        raise SystemExit(f"Failed to load embedding model {EMBED_MODEL}: {exc}")
 
     results = run_experiment(
         experiment_id=args.experiment,

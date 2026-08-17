@@ -39,7 +39,7 @@ Retrieval-Augmented Generation (RAG) is implemented as an external knowledge bas
 
 - **Comparison**: 3-agent Qwen 3.5:2b + RAG vs Qwen 3.5:9b + RAG
 - **Objective**: Evaluate whether multi-agent architecture improves reasoning quality through task decomposition, role specialization, and synthesis
-- **Agent Roles**: 
+- **Agent Roles**:
   - Controller agent: Receives user prompt, distributes tasks
   - Decision-making agents (3 specialized agents): Process decomposed tasks
   - Synthesis agent: Collects and integrates agent responses into unified answer
