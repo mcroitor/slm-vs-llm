@@ -5,8 +5,8 @@ Experiment 2: RAG augmentation (2b+RAG vs 9b+RAG)
 Experiment 3: multi-agent system (input agent -> 3 RAG experts -> output agent)
               vs 9b+RAG
 
-Each configuration records: answer text, latency, token usage. Thinking mode is
-disabled for all Qwen 3.5 calls (see methodology.md).
+All models are loaded directly via the transformers library (no external
+backend/server). Each configuration records: answer text, latency, token usage.
 
 Usage:
     python experiment.py --experiment 3 --tasks tasks.json --kb kb.json --out results.json
@@ -22,11 +22,9 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from sentence_transformers import SentenceTransformer
 import torch
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 SMALL_MODEL = "Qwen/Qwen3.5-2B"
 LARGE_MODEL = "Qwen/Qwen3.5-9B"
 EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
@@ -45,12 +43,6 @@ STOPWORDS = {
 }
 
 
-class OllamaClient:
-    """Legacy client kept for compatibility or removed if unused.
-    Direct HF models are now used in OllamaModel class."""
-    pass
-
-
 @dataclass
 class Generation:
     text: str = ""
@@ -66,56 +58,79 @@ class Generation:
 
 
 class BaseModel:
-    def __init__(self, client: Optional[OllamaClient] = None):
-        self.client = client or OllamaClient()
-
     def generate(self, prompt: str, temperature: float = DEFAULT_TEMPERATURE,
                  max_tokens: int = DEFAULT_MAX_TOKENS) -> Generation:
         raise NotImplementedError
 
 
-class OllamaModel(BaseModel):
-    def __init__(self, name: str, think: bool = False,
-                 client: Optional[OllamaClient] = None):
-        super().__init__(client)
+class HFModel(BaseModel):
+    """Decoder-only model loaded directly from Hugging Face Hub via transformers."""
+
+    def __init__(self, name: str):
         self.name = name
-        self.think = think
         self.tokenizer = AutoTokenizer.from_pretrained(name)
         self.model = AutoModelForCausalLM.from_pretrained(
             name, torch_dtype=torch.float16, device_map="auto"
         )
+        self.model.eval()
 
     def generate(self, prompt: str, temperature: float = DEFAULT_TEMPERATURE,
                  max_tokens: int = DEFAULT_MAX_TOKENS) -> Generation:
         try:
             started = time.perf_counter()
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-            
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                do_sample=True if temperature > 0 else False,
-                pad_token_id=self.tokenizer.eos_token_id
-            )
-            
+            input_len = inputs["input_ids"].shape[1]
+
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    do_sample=temperature > 0,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
+
             latency = time.perf_counter() - started
-            full_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            # Remove the original prompt from the response
-            response_text = full_text[len(prompt):].strip()
-            
-            prompt_tokens = inputs["input_ids"].shape[1]
-            completion_tokens = len(outputs[0]) - prompt_tokens
-            
+            response_text = self.tokenizer.decode(
+                outputs[0][input_len:], skip_special_tokens=True
+            ).strip()
+
             return Generation(
                 text=response_text,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
+                prompt_tokens=input_len,
+                completion_tokens=outputs.shape[1] - input_len,
                 latency_s=latency,
-                tokens_per_s=completion_tokens / latency if latency else 0.0,
+                tokens_per_s=(outputs.shape[1] - input_len) / latency if latency else 0.0,
             )
         except Exception as exc:
             return Generation(error=f"{type(exc).__name__}: {exc}")
+
+
+class TransformersEmbedder:
+    """Sentence embedder loaded from Hugging Face Hub via transformers.
+
+    Uses EOS-token pooling (last hidden state) followed by L2 normalization,
+    as recommended for Qwen3-Embedding models.
+    """
+
+    def __init__(self, name: str = EMBED_MODEL, max_length: int = 512):
+        self.name = name
+        self.max_length = max_length
+        self.tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
+        self.model = AutoModel.from_pretrained(
+            name, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True
+        )
+        self.model.eval()
+
+    def embed(self, text: str) -> List[float]:
+        inputs = self.tokenizer(
+            text, return_tensors="pt", truncation=True, max_length=self.max_length
+        ).to(self.model.device)
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        vector = outputs.last_hidden_state[:, -1, :].squeeze(0)
+        vector = torch.nn.functional.normalize(vector, p=2, dim=-1)
+        return vector.cpu().tolist()
 
 
 class ModelWithRag:
@@ -291,18 +306,17 @@ def run_experiment(experiment_id: str, tasks: Sequence[str],
                    runs: int = 1,
                    embedder: Optional[Callable[[str], List[float]]] = None,
                    small_model_name: str = SMALL_MODEL,
-                   large_model_name: str = LARGE_MODEL,
-                   think: bool = False) -> Dict[str, Any]:
-    if experiment_id in ("2", "3") and not knowledge_base:
-        raise ValueError(f"knowledge_base required for experiment {experiment_id}")
+                   large_model_name: str = LARGE_MODEL) -> Dict[str, Any]:
+    if experiment_id in ("2", "3"):
+        if not knowledge_base:
+            raise ValueError(f"knowledge_base required for experiment {experiment_id}")
+        if embedder is None:
+            raise ValueError("embedder required when knowledge_base provided")
 
-    small = OllamaModel(small_model_name, think=think)
-    large = OllamaModel(large_model_name, think=think)
+    small = HFModel(small_model_name)
+    large = HFModel(large_model_name)
 
-    rag = None
-    if knowledge_base:
-        embed = embedder or (lambda text: OllamaClient().embed(EMBED_MODEL, text))
-        rag = RagModule(knowledge_base, embed, top_k=top_k)
+    rag = RagModule(knowledge_base, embedder, top_k=top_k) if knowledge_base else None
     small_rag = ModelWithRag(small, rag) if rag else None
     large_rag = ModelWithRag(large, rag) if rag else None
     mas = MultiAgentSystem(small, rag) if rag else None
@@ -410,8 +424,8 @@ def main() -> None:
                         help="repetitions per configuration (for consistency)")
     parser.add_argument("--small-model", default=SMALL_MODEL)
     parser.add_argument("--large-model", default=LARGE_MODEL)
-    parser.add_argument("--think", action="store_true",
-                        help="enable Qwen 3.5 thinking mode (off by default)")
+    parser.add_argument("--embed-model", default=EMBED_MODEL,
+                        help="Hugging Face model name for RAG embeddings")
     parser.add_argument("--out", default="results.json")
     parser.add_argument("--human-eval", default="human_eval.csv")
     args = parser.parse_args()
@@ -419,12 +433,10 @@ def main() -> None:
     tasks = json.load(open(args.tasks, encoding="utf-8")) if args.tasks else DEFAULT_TASKS
     kb = json.load(open(args.kb, encoding="utf-8")) if args.kb else DEFAULT_KB
 
-    # Use SentenceTransformer for embedding
     try:
-        encoder = SentenceTransformer(EMBED_MODEL)
-        embedder = lambda text: encoder.encode(text).tolist()
+        embedder = TransformersEmbedder(args.embed_model).embed
     except Exception as exc:
-        raise SystemExit(f"Failed to load embedding model {EMBED_MODEL}: {exc}")
+        raise SystemExit(f"Failed to load embedding model {args.embed_model}: {exc}")
 
     results = run_experiment(
         experiment_id=args.experiment,
@@ -437,7 +449,6 @@ def main() -> None:
         embedder=embedder,
         small_model_name=args.small_model,
         large_model_name=args.large_model,
-        think=args.think,
     )
 
     with open(args.out, "w", encoding="utf-8") as fh:
