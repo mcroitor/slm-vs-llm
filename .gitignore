@@ -2,4 +2,8 @@ __pycache__/
 venv/
 
 # some generated files
+analysis/
 kb.json
+report.md
+results_*.json
+human_eval.csv

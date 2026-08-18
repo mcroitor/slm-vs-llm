@@ -5,6 +5,8 @@ This repository contains the implementation and research data for the study comp
 ## Project Structure
 
 - `experiment.py` — Main execution script for all three experiments.
+- `prepare_kb.py` — Builds the RAG knowledge base from Markdown files.
+- `analyze.py` — Analyzes experiment results (statistics, report, human evaluation).
 - `abstract.md` — Research abstract.
 - `methodology.md` — Detailed experimental design.
 - `discussion.md` — Results analysis and conclusions.
@@ -25,7 +27,7 @@ source venv/bin/activate  # Linux/macOS
 Install the required libraries:
 
 ```bash
-pip install torch transformers sentence-transformers accelerate
+pip install torch transformers accelerate
 ```
 
 ### 2. Model Downloading
@@ -38,7 +40,7 @@ The project uses models from the Qwen family. The script will automatically down
 - **LLM:** `Qwen/Qwen3.5-9B`
 - **Embedding:** `Qwen/Qwen3-Embedding-0.6B`
 
-*Note: Ensure you have enough GPU memory (VRAM) to load the 9B model, or consider using a machine with at least 24GB VRAM for smooth execution.*
+*Note: The script automatically selects CUDA if available, otherwise falls back to CPU (with float32). The 9B model in float16 requires roughly 18 GB of VRAM; with quantization it fits in ~9 GB. For CPU-only execution expect significantly slower inference.*
 
 ### 3. Knowledge Base Preparation
 
@@ -77,7 +79,12 @@ python experiment.py --experiment <ID> --tasks tasks.json --kb kb.json --out res
 - `--max-tokens` (default: 512): Maximum length of the output.
 - `--top-k` (default: 3): Number of documents to retrieve from RAG.
 - `--runs` (default: 1): Number of repetitions per task for consistency analysis.
-- `--think`: Enable thinking mode for Qwen 3.5.
+- `--think {on,off}` (default: off): Enable or disable Qwen 3.5 thinking mode.
+- `--small-model`, `--large-model`: Override the Hugging Face model names.
+- `--embed-model`: Override the Hugging Face embedding model name.
+- `--device auto|cuda|cpu` (default: auto): Override device selection.
+- `--out`: Output JSON path (default: `results.json`).
+- `--human-eval`: Output CSV path for expert review (default: `human_eval.csv`).
 
 ### Example: Running the Multi-Agent Experiment
 
@@ -85,6 +92,51 @@ python experiment.py --experiment <ID> --tasks tasks.json --kb kb.json --out res
 python experiment.py --experiment 3 --tasks tasks.json --kb kb.json --out results_mas.json --runs 3
 ```
 
+## Results Analysis
+
+Run the analyzer on the experiment outputs to produce a statistical report:
+
+```bash
+python analyze.py --results results_1.json results_2.json results_3.json
+```
+
+### Optional Arguments:
+
+- `--gold <file>`: JSON of gold (reference) answers mapped to task texts — enables exact-match and F1 accuracy in the report.
+- `--human-eval <csv...>`: scored human evaluation files (one per rater) to aggregate Likert scores and compute Krippendorff's alpha. If you provide several files, name them after the raters, e.g. `rater_anna.csv rater_bob.csv`.
+- `--rater-names <name...>`: explicit rater names matching the `--human-eval` order.
+- `--out-dir <dir>` (default: `analysis`): output directory for `report.md`.
+
+The report includes: per-configuration summaries, paired comparisons with Wilcoxon signed-rank test, Cliff's delta, and wins/ties/losses for the core contrasts (`2b` vs `9b`, `2b+RAG` vs `9b+RAG`, `MAS(2b+RAG)` vs `9b+RAG`), quality-per-cost trade-offs, a synthesizer fidelity check for Experiment 3, and human-evaluation statistics.
+
 ## Evaluation
 
 The script generates a `results.json` file containing all responses and a `human_eval.csv` file formatted for expert review.
+
+## Human Evaluation
+
+The `human_eval.csv` file contains one row per configuration run, with the model's response and computed metrics (token usage, latency). The remaining columns are to be filled in by human evaluators on a Likert scale from 1 (very poor) to 5 (excellent).
+
+### Evaluation Dimensions
+
+| Column | What to Assess |
+| --- | --- |
+| `accuracy_1_5` | Factual correctness and task completion |
+| `coherence_1_5` | Logical flow and structure of the response |
+| `comprehensiveness_1_5` | Coverage of all task requirements |
+| `reasoning_1_5` | Quality of step-by-step logic (where applicable) |
+| `consistency_1_5` | Agreement of the answer with the expected content |
+
+### Procedure
+
+1. **Split the CSV**: distribute responses among evaluators so that each response is rated by at least two independent evaluators (needed for inter-rater agreement).
+2. **Blind rating**: evaluators see only the response text, not the configuration name or the model that produced it. For this, use a copy of the CSV with the `config` column removed.
+3. **Fill in scores**: evaluators assign a score from 1 to 5 for each dimension and may add notes.
+4. **Merge the results**: collect the completed files and merge them into a single `human_eval_scored.csv` for the analysis script.
+5. **Check agreement**: with two or more raters per response, the analysis script computes inter-rater reliability (Krippendorff's alpha) to confirm the ratings are consistent.
+
+### Notes
+
+- If a response is empty or an error occurred, rate it `1` and add a note.
+- Keep at least two raters per response so that agreement can be measured; the more raters, the more reliable the scores.
+- Scores are stored in the CSV only; the analysis script (`analyze.py`) aggregates them per configuration and task and runs the statistical tests described in `methodology.md`.

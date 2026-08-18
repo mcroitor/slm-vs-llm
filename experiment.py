@@ -63,15 +63,23 @@ class BaseModel:
         raise NotImplementedError
 
 
+def _resolve_device(device: Optional[str]) -> str:
+    if device and device != "auto":
+        return device
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 class HFModel(BaseModel):
     """Decoder-only model loaded directly from Hugging Face Hub via transformers."""
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, device: Optional[str] = None):
         self.name = name
+        self.device = _resolve_device(device)
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
         self.tokenizer = AutoTokenizer.from_pretrained(name)
         self.model = AutoModelForCausalLM.from_pretrained(
-            name, dtype=torch.float16 # , device_map="auto"
-        ).to("cuda")
+            name, torch_dtype=dtype
+        ).to(self.device)
         self.model.eval()
 
     def generate(self, prompt: str, temperature: float = DEFAULT_TEMPERATURE,
@@ -120,13 +128,16 @@ class TransformersEmbedder:
     as recommended for Qwen3-Embedding models.
     """
 
-    def __init__(self, name: str = EMBED_MODEL, max_length: int = 512):
+    def __init__(self, name: str = EMBED_MODEL, max_length: int = 512,
+                 device: Optional[str] = None):
         self.name = name
         self.max_length = max_length
+        self.device = _resolve_device(device)
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
         self.tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
         self.model = AutoModel.from_pretrained(
-            name, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True
-        )
+            name, torch_dtype=dtype, trust_remote_code=True
+        ).to(self.device)
         self.model.eval()
 
     def embed(self, text: str) -> List[float]:
@@ -146,11 +157,11 @@ class ModelWithRag:
         self.rag = rag
 
     def generate(self, prompt: str, temperature: float = DEFAULT_TEMPERATURE,
-                 max_tokens: int = DEFAULT_MAX_TOKENS) -> Generation:
+                 max_tokens: int = DEFAULT_MAX_TOKENS, think: bool = False) -> Generation:
         context = self.rag.retrieve(prompt)
         if context:
             prompt = f"Relevant context:\n{context}\n\nTask:\n{prompt}"
-        return self.model.generate(prompt, temperature, max_tokens)
+        return self.model.generate(prompt, temperature, max_tokens, think=think)
 
 
 def cosine(a: Sequence[float], b: Sequence[float]) -> float:
@@ -198,39 +209,41 @@ class ExpertAgent:
         self.name = name
         self.generator = generator
 
-    def process(self, subtask: str) -> Generation:
-        return self.generator.generate(subtask)
+    def process(self, subtask: str, think: bool = False) -> Generation:
+        return self.generator.generate(subtask, think=think)
 
 
 class OutputAgent:
     def __init__(self, model: BaseModel):
         self.model = model
 
-    def synthesize(self, task: str, responses: Dict[str, Generation]) -> Generation:
+    def synthesize(self, task: str, responses: Dict[str, Generation],
+                   think: bool = False) -> Generation:
         blocks = "\n".join(f"[{role}]:\n{resp.text}" for role, resp in responses.items())
         prompt = (
             f"Task:\n{task}\n\nExpert responses:\n{blocks}\n\n"
             "Synthesize a single coherent final answer integrating the expert responses."
         )
-        return self.model.generate(prompt)
+        return self.model.generate(prompt, think=think)
 
 
 class MultiAgentSystem:
     def __init__(self, model: BaseModel, rag: RagModule,
-                 roles: Sequence[str] = DEFAULT_ROLES):
+                 roles: Sequence[str] = DEFAULT_ROLES, think: bool = False):
         self.input_agent = InputAgent(model)
         self.experts = [
             ExpertAgent(f"expert-{role}", ModelWithRag(model, rag)) for role in roles
         ]
         self.output_agent = OutputAgent(model)
         self.roles = list(roles)
+        self.think = think
 
     def run(self, task: str) -> Dict[str, Any]:
         subtasks = self.input_agent.decompose(task, self.roles)
         responses = {}
         for role, expert in zip(self.roles, self.experts):
-            responses[role] = expert.process(subtasks[role])
-        final = self.output_agent.synthesize(task, responses)
+            responses[role] = expert.process(subtasks[role], think=self.think)
+        final = self.output_agent.synthesize(task, responses, think=self.think)
         return {
             "subtasks": subtasks,
             "responses": {r: g.text for r, g in responses.items()},
@@ -314,7 +327,8 @@ def run_experiment(experiment_id: str, tasks: Sequence[str],
                    embedder: Optional[Callable[[str], List[float]]] = None,
                    small_model_name: str = SMALL_MODEL,
                    large_model_name: str = LARGE_MODEL,
-                   think: bool = False) -> Dict[str, Any]:
+                   think: bool = False,
+                   device: Optional[str] = None) -> Dict[str, Any]:
     print(f"\n>>> Starting Experiment {experiment_id} (Thinking: {'ON' if think else 'OFF'})")
     if experiment_id in ("2", "3"):
         if not knowledge_base:
@@ -323,13 +337,13 @@ def run_experiment(experiment_id: str, tasks: Sequence[str],
             raise ValueError("embedder required when knowledge_base provided")
 
     print(f"Loading models: {small_model_name}, {large_model_name}...")
-    small = HFModel(small_model_name)
-    large = HFModel(large_//model_name)
+    small = HFModel(small_model_name, device=device)
+    large = HFModel(large_model_name, device=device)
 
     rag = RagModule(knowledge_base, embedder, top_k=top_k) if knowledge_base else None
     small_rag = ModelWithRag(small, rag) if rag else None
     large_rag = ModelWithRag(large, rag) if rag else None
-    mas = MultiAgentSystem(small, rag) if rag else None
+    mas = MultiAgentSystem(small, rag, think=think) if rag else None
 
     results: Dict[str, Any] = {"experiment": experiment_id, "tasks": {}}
 
@@ -356,10 +370,12 @@ def run_experiment(experiment_id: str, tasks: Sequence[str],
             mas_runs = []
             for _ in range(runs):
                 mas_result = mas.run(task)
+                errors = [g.error for g in mas_result["all_generations"] if g.error]
                 mas_runs.append({
                     "subtasks": mas_result["subtasks"],
                     "responses": mas_result["responses"],
                     "final": mas_result["final"].text,
+                    "errors": errors,
                     "metrics": aggregate_metrics(mas_result["all_generations"]),
                 })
             final_texts = [m["final"] for m in mas_runs]
@@ -381,7 +397,7 @@ def run_experiment(experiment_id: str, tasks: Sequence[str],
             }
             print("  Running 9B+RAG...")
             configs["9b+RAG"] = pack_run(
-                [large_rag.generate(task) for _ in range(runs)], task)
+                [large_rag.generate(task, think=think) for _ in range(runs)], task)
 
         results["tasks"][task] = configs
         print(f"  ✓ Task {i} completed.")
@@ -418,16 +434,17 @@ def write_human_eval_csv(results: Dict[str, Any], out_path: str) -> None:
         for task, configs in results["tasks"].items():
             for config, payload in configs.items():
                 for idx, run in enumerate(payload["runs"], 1):
+                    metrics = run.get("metrics", {})
                     writer.writerow({
                         "experiment": results["experiment"],
                         "task": task,
                         "config": config,
                         "run": idx,
-                        "response": run.get("response", ""),
-                        "prompt_tokens": run.get("prompt_tokens", 0),
-                        "completion_tokens": run.get("completion_tokens", 0),
-                        "total_tokens": run.get("total_tokens", 0),
-                        "latency_s": run.get("latency_s", 0.0),
+                        "response": run.get("response") or run.get("final", ""),
+                        "prompt_tokens": run.get("prompt_tokens", metrics.get("prompt_tokens", 0)),
+                        "completion_tokens": run.get("completion_tokens", metrics.get("completion_tokens", 0)),
+                        "total_tokens": run.get("total_tokens", metrics.get("total_tokens", 0)),
+                        "latency_s": run.get("latency_s", metrics.get("latency_s", 0.0)),
                     })
 
 
@@ -447,6 +464,8 @@ def main() -> None:
     parser.add_argument("--large-model", default=LARGE_MODEL)
     parser.add_argument("--embed-model", default=EMBED_MODEL,
                         help="Hugging Face model name for RAG embeddings")
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto",
+                        help="device to run inference on")
     parser.add_argument("--out", default="results.json")
     parser.add_argument("--human-eval", default="human_eval.csv")
     args = parser.parse_args()
@@ -455,10 +474,11 @@ def main() -> None:
     kb = json.load(open(args.kb, encoding="utf-8")) if args.kb else DEFAULT_KB
 
     try:
-        embedder = TransformersEmbedder(args.embed_model).embed
+        embedder = TransformersEmbedder(args.embed_model, device=args.device).embed
     except Exception as exc:
         raise SystemExit(f"Failed to load embedding model {args.embed_model}: {exc}")
 
+    think = args.think == "on"
     results = run_experiment(
         experiment_id=args.experiment,
         tasks=tasks,
@@ -470,6 +490,8 @@ def main() -> None:
         embedder=embedder,
         small_model_name=args.small_model,
         large_model_name=args.large_model,
+        think=think,
+        device=args.device,
     )
 
     with open(args.out, "w", encoding="utf-8") as fh:
