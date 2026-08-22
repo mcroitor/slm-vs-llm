@@ -7,3 +7,4 @@ kb.json
 report.md
 results_*.json
 human_eval.csv
+*.pdf

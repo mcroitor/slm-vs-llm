@@ -119,13 +119,13 @@ The `human_eval.csv` file contains one row per configuration run, with the model
 
 ### Evaluation Dimensions
 
-| Column | What to Assess |
-| --- | --- |
-| `accuracy_1_5` | Factual correctness and task completion |
-| `coherence_1_5` | Logical flow and structure of the response |
-| `comprehensiveness_1_5` | Coverage of all task requirements |
-| `reasoning_1_5` | Quality of step-by-step logic (where applicable) |
-| `consistency_1_5` | Agreement of the answer with the expected content |
+| Column                  | What to Assess                                    |
+| ----------------------- | ------------------------------------------------- |
+| `accuracy_1_5`          | Factual correctness and task completion           |
+| `coherence_1_5`         | Logical flow and structure of the response        |
+| `comprehensiveness_1_5` | Coverage of all task requirements                 |
+| `reasoning_1_5`         | Quality of step-by-step logic (where applicable)  |
+| `consistency_1_5`       | Agreement of the answer with the expected content |
 
 ### Procedure
 
